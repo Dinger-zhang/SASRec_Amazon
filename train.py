@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from model import SASRec
 from utils import SequenceDataset, NDCG_at_k, Hit_at_k, parse_history
 import pickle
@@ -47,35 +48,33 @@ def train(args):
     os.makedirs('saved_models', exist_ok=True)
     os.makedirs('results', exist_ok=True)
 
+    scaler = GradScaler()
     for epoch in range(1, num_epochs + 1):
         model.train()
         total_loss = 0.0
+
         for seq, target in tqdm(train_loader, desc=f'Epoch {epoch}'):
             seq = seq.to(device)
             target = target.to(device)
 
-            # 输入去掉最后一个位置，预测最后一步
-            input_seq = seq[:, :-1]  # (batch, max_len-1)
-            logits = model(input_seq)  # (batch, max_len-1, item_num+1)
-            last_logits = logits[:, -1, :]  # (batch, item_num+1)
-
-            loss = criterion(last_logits, target)
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+
+            # 将前向传播包裹在 autocast 上下文中
+            with autocast():
+                input_seq = seq[:, :-1]
+                logits = model(input_seq)
+                last_logits = logits[:, -1, :]
+                loss = criterion(last_logits, target)
+
+            # 使用 scaler 进行反向传播和优化器更新
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch} Loss: {avg_loss:.4f}")
-
-        # 验证
-        model.eval()
-        ndcg, hit = evaluate_batch(model, val_csv, item2id, id2item, max_len, device)
-        print(f"Validation - NDCG@10: {ndcg:.4f}, Hit@10: {hit:.4f}")
-
-        if ndcg > best_ndcg:
-            best_ndcg = ndcg
-            torch.save(model.state_dict(), f'saved_models/{category}_best.pth')
 
     # 测试
     model.load_state_dict(torch.load(f'saved_models/{category}_best.pth'))
